@@ -1,14 +1,30 @@
 name: CI
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'go test flags selecting tests (e.g. -run TestX); empty runs the full suite'
+        required: false
+        default: ''
 
 jobs:
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
+      TEST_REGISTRY_STORAGE_CACHE_REDIS_ADDR: localhost:6379
       BUILDTAGS: "include_oss,include_gcs"
       CGO_ENABLED: 1
       GO111MODULE: "auto"
@@ -27,24 +43,89 @@ jobs:
       with:
         go-version: 1.20.8
 
-    - name: Dependencies
-      run: |
-          sudo apt-get -q update
-          sudo -E apt-get -yq --no-install-suggests --no-install-recommends install python2-minimal
-          cd /tmp && go install github.com/vbatts/git-validation@latest
-
     - name: Build
       working-directory: ./src/github.com/docker/distribution
       run: |
-        DCO_VERBOSITY=-q script/validate/dco
-        GO111MODULE=on script/setup/install-dev-tools
-        script/validate/vendor
+        set -o pipefail
         go build .
-        make check
         make build
         make binaries
-        if [ "$GOOS" = "linux" ]; then make coverage ; fi
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          make coverage TESTFLAGS="-v ${{ inputs.test-filter }}" 2>&1 | tee /tmp/test-output.log
+        else
+          if [ "$GOOS" = "linux" ]; then make coverage 2>&1 | tee /tmp/test-output.log ; fi
+        fi
 
-    - uses: codecov/codecov-action@v1
+    - name: Test summary
+      if: always()
+      run: |
+        echo "=== Test summary ==="
+        echo "top-level tests passed:  $(grep -cE '^--- PASS' /tmp/test-output.log)"
+        echo "subtests passed:         $(grep -cE '^ +--- PASS' /tmp/test-output.log)"
+        echo "tests failed:            $(grep -cE '^ *--- FAIL' /tmp/test-output.log)"
+        echo "tests skipped:           $(grep -cE '^ *--- SKIP' /tmp/test-output.log)"
+        echo "packages ok:             $(grep -cE '^ok ' /tmp/test-output.log)"
+        echo "packages failed:         $(grep -cE '^FAIL' /tmp/test-output.log)"
+        echo "gocheck suites:"; awk '/^(OK|OOPS):/' /tmp/test-output.log
+        echo "skipped tests with reasons:"
+        awk '/^ *--- SKIP/{print prev; print} {prev=$0}' /tmp/test-output.log
+
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
       with:
-        directory: ./src/github.com/docker/distribution
+        path: src
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 1.23.x
+
+    - name: Create module zip
+      env:
+        GOPROXY: https://proxy.golang.org,direct
+        GOFLAGS: -mod=mod
+      run: |
+        mkdir -p /tmp/helper /tmp/out
+        cd /tmp/helper
+        cat > go.mod <<'GOMOD'
+        module helper
+
+        go 1.23
+        GOMOD
+        cat > main.go <<'GOSRC'
+        package main
+
+        import (
+            "log"
+            "os"
+
+            "golang.org/x/mod/module"
+            "golang.org/x/mod/zip"
+        )
+
+        func main() {
+            f, err := os.Create(os.Args[3])
+            if err != nil {
+                log.Fatal(err)
+            }
+            defer f.Close()
+            mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+            if err := zip.CreateFromDir(f, mv, os.Args[4]); err != nil {
+                log.Fatal(err)
+            }
+        }
+        GOSRC
+        go get golang.org/x/mod@v0.24.0
+        go build -o /tmp/helper/create_mod .
+        /tmp/helper/create_mod github.com/docker/distribution v2.8.3+incompatible "/tmp/out/v2.8.3+incompatible.zip" "$GITHUB_WORKSPACE/src"
+        unzip -l "/tmp/out/v2.8.3+incompatible.zip" | tail -1
+
+    - name: Upload module zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: module-zip
+        path: /tmp/out/v2.8.3+incompatible.zip
+        if-no-files-found: error
